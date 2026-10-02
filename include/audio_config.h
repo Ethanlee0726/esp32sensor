@@ -5,6 +5,7 @@
 
 #define PDM_CLK_PIN GPIO_NUM_1
 #define PDM_DATA_PIN GPIO_NUM_41
+#define BUZZER_PIN GPIO_NUM_42
 
 #define SAMPLE_RATE 16000
 #define CHANNELS 1

@@ -33,9 +33,13 @@ enum PendingCommandType : uint8_t {
 
 struct PendingCommand {
   PendingCommandType type = PENDING_NONE;
+  char command[64] = {};
   char date[9] = {};
   char time[7] = {};
   uint8_t senderMac[6] = {};
+  unsigned long receivedMillis = 0;
+  bool queuedWhileSdNotReady = false;
+  uint8_t sdRetryFailures = 0;
 };
 
 PendingCommand pendingCommand;
@@ -47,12 +51,25 @@ constexpr uint8_t SD_MISO_PIN = 12;
 constexpr uint8_t SD_MOSI_PIN = 15;
 constexpr uint8_t SD_CS_PIN = 16;
 const unsigned long SD_RETRY_INTERVAL_MS = 2000;
+constexpr uint8_t SD_START_RETRY_LIMIT = 10;
 
-bool sdCardReady = false;
+volatile bool sdCardReady = false;
+bool sdTestAttemptFailed = false;
 bool sdCardBeginAttempted = false;
 bool sdSpiStarted = false;
 unsigned long nextSdRetryMillis = 0;
+bool startSdCheckRequired = false;
 bool audioReady = false;
+unsigned long sdReadyMillis = 0;
+bool startPeerConfigured = false;
+
+constexpr uint8_t ESPNOW_CHANNEL = 1;
+constexpr uint8_t ESPNOW_RETRY_LIMIT = 3;
+constexpr unsigned long ESPNOW_CALLBACK_TIMEOUT_MS = 1000;
+volatile bool sendCallbackReceived = false;
+volatile esp_now_send_status_t sendCallbackStatus = ESP_NOW_SEND_FAIL;
+volatile uint8_t sendCallbackMac[6] = {};
+portMUX_TYPE sendCallbackMux = portMUX_INITIALIZER_UNLOCKED;
 
 FsFile recordingWavFile;
 FsFile eventsFile;
@@ -108,6 +125,7 @@ void unmountSdCard() {
   pinMode(SD_CS_PIN, OUTPUT);
   digitalWrite(SD_CS_PIN, HIGH);
   sdCardReady = false;
+  sdReadyMillis = 0;
 }
 
 void markSdCardNeedsRemount(const char *reason) {
@@ -252,7 +270,31 @@ bool runSdCardTest() {
   Serial.printf("[SD] Read back: %s\n", readBuffer);
   Serial.println("[SD] SD TEST PASSED");
   sdCardReady = true;
+  sdReadyMillis = millis();
+  Serial.printf("[TIME] SD ready millis: %lu\n", sdReadyMillis);
   return true;
+}
+
+bool runSdCardTestWithRetries() {
+  sdTestAttemptFailed = false;
+
+  if (!startSdCheckRequired && (sdCardReady || millis() < nextSdRetryMillis)) {
+    return sdCardReady;
+  }
+
+  if (millis() < nextSdRetryMillis) {
+    return sdCardReady;
+  }
+
+  if (runSdCardTest()) {
+    nextSdRetryMillis = 0;
+    startSdCheckRequired = false;
+    return true;
+  }
+
+  sdTestAttemptFailed = true;
+  nextSdRetryMillis = millis() + SD_RETRY_INTERVAL_MS;
+  return false;
 }
 
 void reportRecordingError(const char *message) {
@@ -312,17 +354,52 @@ bool parseTimedCommand(const uint8_t *incomingData,
   return true;
 }
 
-void queuePendingCommand(PendingCommandType type,
+bool queuePendingCommand(PendingCommandType type,
                          const char *date,
                          const char *time,
-                         const uint8_t *senderMac) {
+                         const uint8_t *senderMac,
+                         unsigned long receivedMillis) {
+  bool queuedWhileSdNotReady =
+      type == PENDING_START && !sdCardReady;
+
   portENTER_CRITICAL(&pendingCommandMux);
+
+  // Keep an early START until the SD retry loop can process it.  A duplicate
+  // START must not replace or execute the already queued request.
+  if (pendingCommandReady &&
+      (pendingCommand.type == PENDING_START || type == PENDING_START)) {
+    portEXIT_CRITICAL(&pendingCommandMux);
+    return false;
+  }
+
   pendingCommand.type = type;
+  snprintf(pendingCommand.command,
+           sizeof(pendingCommand.command),
+           "%s,%s,%s",
+           type == PENDING_START ? "START" : "STOP",
+           date,
+           time);
   memcpy(pendingCommand.date, date, sizeof(pendingCommand.date));
   memcpy(pendingCommand.time, time, sizeof(pendingCommand.time));
   memcpy(pendingCommand.senderMac, senderMac, sizeof(pendingCommand.senderMac));
+  pendingCommand.receivedMillis = receivedMillis;
+  pendingCommand.queuedWhileSdNotReady = queuedWhileSdNotReady;
+  pendingCommand.sdRetryFailures = 0;
   pendingCommandReady = true;
   portEXIT_CRITICAL(&pendingCommandMux);
+  return true;
+}
+
+bool peekPendingCommand(PendingCommand &command) {
+  portENTER_CRITICAL(&pendingCommandMux);
+  if (!pendingCommandReady) {
+    portEXIT_CRITICAL(&pendingCommandMux);
+    return false;
+  }
+
+  command = pendingCommand;
+  portEXIT_CRITICAL(&pendingCommandMux);
+  return true;
 }
 
 bool takePendingCommand(PendingCommand &command) {
@@ -374,14 +451,6 @@ bool writeEventRecord(const char *eventName,
 
 bool beginRecording(const char *date, const char *time) {
   if (!sdCardReady) {
-    if (millis() >= nextSdRetryMillis && runSdCardTest()) {
-      nextSdRetryMillis = 0;
-    } else {
-      nextSdRetryMillis = millis() + SD_RETRY_INTERVAL_MS;
-    }
-  }
-
-  if (!sdCardReady) {
     Serial.println("[REC] ERROR: SD card is not mounted");
     return false;
   }
@@ -398,10 +467,13 @@ bool beginRecording(const char *date, const char *time) {
     return false;
   }
   if (directoryStatus == RECORDINGS_NOT_A_DIRECTORY) {
+    markSdCardNeedsRemount("/recordings is not a directory");
     return false;
   }
 
   recordingBaseName = String(date) + "_" + String(time);
+  Serial.printf("[TIME] WAV filename datetime: %s %s\n", date, time);
+  Serial.printf("[TIME] SD ready millis: %lu\n", sdReadyMillis);
   const String wavPath =
       String("/recordings/") + recordingBaseName + ".wav";
   const String eventsPath =
@@ -452,6 +524,8 @@ bool beginRecording(const char *date, const char *time) {
   memcpy(recordingStartTime, time, sizeof(recordingStartTime));
   recordingStartMillis = startMillis;
   runningStartMillis = startMillis;
+  Serial.printf("[TIME] Actual recording start millis: %lu\n",
+                recordingStartMillis);
   Serial.printf("[REC] Started: %s\n", wavPath.c_str());
   Serial.printf("[REC] Events: %s\n", eventsPath.c_str());
   return true;
@@ -510,6 +584,41 @@ void makeEndTimestamp(char *dateOut, char *timeOut, unsigned long eventMillis) {
   snprintf(timeOut, 7, "%02d%02d%02d", hour, minute, second);
 }
 
+bool verifyRecordingFiles() {
+  const String wavPath =
+      String("/recordings/") + recordingBaseName + ".wav";
+  const String eventsPath =
+      String("/recordings/") + recordingBaseName + "_events.csv";
+
+  FsFile wavFile = sdCard.open(wavPath.c_str(), O_RDONLY);
+  const bool wavOk = wavFile && wavFile.size() >= sizeof(WavHeader);
+  const uint32_t wavSize = wavFile ? wavFile.size() : 0;
+  if (wavFile) {
+    wavFile.close();
+  }
+
+  FsFile eventFile = sdCard.open(eventsPath.c_str(), O_RDONLY);
+  const bool eventsOk = eventFile && eventFile.size() > 0;
+  const uint32_t eventsSize = eventFile ? eventFile.size() : 0;
+  if (eventFile) {
+    eventFile.close();
+  }
+
+  Serial.printf("[REC] File verify: WAV=%s (%lu bytes), EVENTS=%s (%lu bytes)\n",
+                wavOk ? "OK" : "FAIL",
+                static_cast<unsigned long>(wavSize),
+                eventsOk ? "OK" : "FAIL",
+                static_cast<unsigned long>(eventsSize));
+  return wavOk && eventsOk;
+}
+
+void beepRecordingSuccess() {
+  tone(BUZZER_PIN, 2000);
+  delay(300);
+  noTone(BUZZER_PIN);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
 bool finishRecording(const char *eventName,
                      const char *date,
                      const char *time,
@@ -534,6 +643,22 @@ bool finishRecording(const char *eventName,
     }
     eventsFile.close();
   }
+
+  if (!verifyRecordingFiles()) {
+    reportRecordingError("Recording file verification failed");
+    markSdCardNeedsRemount("recording file verification failure");
+    return false;
+  }
+
+  beepRecordingSuccess();
+
+  const unsigned long wavCompleteMillis = millis();
+  char wavCompleteDate[9] = {};
+  char wavCompleteTime[7] = {};
+  makeEndTimestamp(wavCompleteDate, wavCompleteTime, wavCompleteMillis);
+  Serial.printf("[TIME] WAV complete millis: %lu\n", wavCompleteMillis);
+  Serial.printf("[TIME] WAV complete datetime: %s %s\n",
+                wavCompleteDate, wavCompleteTime);
 
   Serial.printf("[REC] Recording stopped: %s\n", eventName);
   recordingBaseName = "";
@@ -572,58 +697,210 @@ void printPacketDetails(const uint8_t *data, size_t length) {
   Serial.println();
 }
 
-void sendDoneToStartSender() {
-  if (!hasStartSenderMac) {
-    printTimestampPrefix();
-    Serial.println("DONE send failed: START sender MAC unavailable");
-    return;
+bool recreatePeerForStartSender(const uint8_t *senderMac) {
+  if (senderMac == nullptr) {
+    return false;
+  }
+
+  printTimestampPrefix();
+  Serial.println("START received: refreshing M5 peer");
+  printMacLine("START source MAC: ", senderMac);
+
+  if (hasStartSenderMac &&
+      memcmp(startSenderMac, senderMac, sizeof(startSenderMac)) != 0 &&
+      esp_now_is_peer_exist(startSenderMac)) {
+    const esp_err_t oldPeerResult = esp_now_del_peer(startSenderMac);
+    Serial.printf("Old M5 peer delete result: %d\n", oldPeerResult);
+  }
+
+  if (esp_now_is_peer_exist(senderMac)) {
+    const esp_err_t existingPeerResult = esp_now_del_peer(senderMac);
+    Serial.printf("Existing M5 peer delete result: %d\n",
+                  existingPeerResult);
+    if (existingPeerResult != ESP_OK &&
+        existingPeerResult != ESP_ERR_ESPNOW_NOT_FOUND) {
+      return false;
+    }
   }
 
   esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, startSenderMac, 6);
-  peerInfo.channel = 1;
+  memcpy(peerInfo.peer_addr, senderMac, sizeof(peerInfo.peer_addr));
+  peerInfo.channel = ESPNOW_CHANNEL;
   peerInfo.ifidx = WIFI_IF_STA;
   peerInfo.encrypt = false;
 
-  printTimestampPrefix();
-  Serial.println("TX DONE");
-  Serial.printf("Elapsed since START: %lu ms\n", millis() - runningStartMillis);
-  printMacLine("Target MAC: ", startSenderMac);
-  printPacketDetails(reinterpret_cast<const uint8_t *>("DONE"), 4);
-  Serial.printf("Channel: %d\n", peerInfo.channel);
-
-  if (!esp_now_is_peer_exist(startSenderMac)) {
-    const esp_err_t peerResult = esp_now_add_peer(&peerInfo);
-    Serial.printf("Peer add result: %d\n", peerResult);
-    if (peerResult != ESP_OK && peerResult != ESP_ERR_ESPNOW_EXIST) {
-      printTimestampPrefix();
-      Serial.printf("DONE send failed: peer add error: %d\n", peerResult);
-      return;
-    }
-  } else {
-    Serial.println("Peer already exists; reusing peer");
+  Serial.printf("M5 peer settings: channel=%d ifidx=WIFI_IF_STA encrypt=false\n",
+                peerInfo.channel);
+  const esp_err_t peerResult = esp_now_add_peer(&peerInfo);
+  Serial.printf("New M5 peer add result: %d\n", peerResult);
+  if (peerResult != ESP_OK && peerResult != ESP_ERR_ESPNOW_EXIST) {
+    return false;
   }
 
-  Serial.printf("Peer exists: %s\n",
-                esp_now_is_peer_exist(startSenderMac) ? "YES" : "NO");
+  memcpy(startSenderMac, senderMac, sizeof(startSenderMac));
+  hasStartSenderMac = true;
+  return esp_now_is_peer_exist(senderMac);
+}
 
-  const char *doneMessage = "DONE";
+bool ensurePeer(const uint8_t *targetMac) {
+  if (esp_now_is_peer_exist(targetMac)) {
+    return true;
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, targetMac, sizeof(peerInfo.peer_addr));
+  peerInfo.channel = ESPNOW_CHANNEL;
+  peerInfo.ifidx = WIFI_IF_STA;
+  peerInfo.encrypt = false;
+  const esp_err_t peerResult = esp_now_add_peer(&peerInfo);
+  Serial.printf("Peer add result: %d\n", peerResult);
+  return (peerResult == ESP_OK || peerResult == ESP_ERR_ESPNOW_EXIST) &&
+         esp_now_is_peer_exist(targetMac);
+}
+
+const char *sendStatusName(bool success) {
+  return success ? "SUCCESS" : "FAIL";
+}
+
+bool sendPacketWithCallback(const char *packetName,
+                            const uint8_t *targetMac,
+                            const uint8_t *payload,
+                            size_t payloadLength,
+                            uint8_t retryLimit) {
+  if (targetMac == nullptr || !ensurePeer(targetMac)) {
+    printTimestampPrefix();
+    Serial.printf("[ESPNOW] %s send failed: peer unavailable\n", packetName);
+    return false;
+  }
+
+  for (uint8_t attempt = 1; attempt <= retryLimit; ++attempt) {
+    portENTER_CRITICAL(&sendCallbackMux);
+    sendCallbackReceived = false;
+    sendCallbackStatus = ESP_NOW_SEND_FAIL;
+    memset((void *)sendCallbackMac, 0, sizeof(sendCallbackMac));
+    portEXIT_CRITICAL(&sendCallbackMux);
+
+    printTimestampPrefix();
+    Serial.printf("[ESPNOW] packet=%s attempt=%u/%u\n",
+                  packetName, attempt, retryLimit);
+    printMacLine("Target MAC: ", targetMac);
+    Serial.printf("Channel: %d\n", ESPNOW_CHANNEL);
+    printPacketDetails(payload, payloadLength);
+
+    const esp_err_t sendResult = esp_now_send(
+        targetMac,
+        payload,
+        payloadLength);
+    Serial.printf("esp_now_send return: %d\n", sendResult);
+
+    bool callbackReceived = false;
+    esp_now_send_status_t callbackStatus = ESP_NOW_SEND_FAIL;
+    unsigned long waitStartMillis = millis();
+    while (millis() - waitStartMillis < ESPNOW_CALLBACK_TIMEOUT_MS) {
+      uint8_t callbackMac[6] = {};
+      portENTER_CRITICAL(&sendCallbackMux);
+      callbackReceived = sendCallbackReceived;
+      if (callbackReceived) {
+        callbackStatus = sendCallbackStatus;
+        memcpy(callbackMac, (const void *)sendCallbackMac, sizeof(callbackMac));
+      }
+      portEXIT_CRITICAL(&sendCallbackMux);
+      if (callbackReceived && memcmp(callbackMac, targetMac, sizeof(callbackMac)) != 0) {
+        callbackReceived = false;
+        portENTER_CRITICAL(&sendCallbackMux);
+        sendCallbackReceived = false;
+        portEXIT_CRITICAL(&sendCallbackMux);
+      }
+      if (callbackReceived) {
+        break;
+      }
+      yield();
+    }
+
+    if (sendResult != ESP_OK) {
+      Serial.printf("callback status: FAIL (send return=%d)\n", sendResult);
+    } else if (!callbackReceived) {
+      Serial.println("callback status: FAIL (timeout)");
+    } else {
+      Serial.printf("callback status: %s\n",
+                    sendStatusName(callbackStatus == ESP_NOW_SEND_SUCCESS));
+    }
+
+    if (sendResult == ESP_OK && callbackReceived &&
+        callbackStatus == ESP_NOW_SEND_SUCCESS) {
+      printTimestampPrefix();
+      Serial.printf("[ESPNOW] %s send confirmed SUCCESS\n", packetName);
+      return true;
+    }
+
+    if (attempt < retryLimit) {
+      Serial.printf("[ESPNOW] %s retrying after failed callback\n",
+                    packetName);
+    }
+  }
+
   printTimestampPrefix();
-  Serial.println("Sending DONE...");
+  Serial.printf("[ESPNOW] %s send failed after %u attempts\n",
+                packetName, retryLimit);
+  return false;
+}
 
-  esp_err_t sendResult = esp_now_send(
-      startSenderMac,
-      reinterpret_cast<const uint8_t *>(doneMessage),
-      strlen(doneMessage));
-
-  Serial.printf("esp_now_send return: %d\n", sendResult);
-
-  if (sendResult == ESP_OK) {
+bool sendErrorToSender(const uint8_t *senderMac) {
+  if (senderMac == nullptr) {
     printTimestampPrefix();
-    Serial.println("DONE sent successfully");
-  } else {
+    Serial.println("ERROR send failed: START sender MAC unavailable");
+    return false;
+  }
+
+  const char *errorMessage = "ERROR";
+  return sendPacketWithCallback(
+      "ERROR",
+      senderMac,
+      reinterpret_cast<const uint8_t *>(errorMessage),
+      strlen(errorMessage),
+      ESPNOW_RETRY_LIMIT);
+}
+
+bool recordPendingStartRetry(PendingCommand &exhaustedCommand) {
+  bool retryRecorded = false;
+  bool retryLimitReached = false;
+  uint8_t retryCount = 0;
+
+  portENTER_CRITICAL(&pendingCommandMux);
+  if (pendingCommandReady &&
+      pendingCommand.type == PENDING_START &&
+      !sdCardReady) {
+    ++pendingCommand.sdRetryFailures;
+    retryCount = pendingCommand.sdRetryFailures;
+    retryRecorded = true;
+    if (pendingCommand.sdRetryFailures >= SD_START_RETRY_LIMIT) {
+      exhaustedCommand = pendingCommand;
+      pendingCommandReady = false;
+      retryLimitReached = true;
+    }
+  }
+  portEXIT_CRITICAL(&pendingCommandMux);
+
+  if (retryRecorded) {
+    Serial.printf("[REC] START retry %u/%u\n",
+                  retryCount,
+                  SD_START_RETRY_LIMIT);
+  }
+
+  return retryLimitReached;
+}
+
+void failQueuedStartAfterSdRetries() {
+  if (!sdTestAttemptFailed) {
+    return;
+  }
+
+  PendingCommand command;
+  if (recordPendingStartRetry(command)) {
+    startSdCheckRequired = false;
     printTimestampPrefix();
-    Serial.printf("DONE send failed: %d\n", sendResult);
+    Serial.println("START failed: SD card initialization retries exhausted");
+    sendErrorToSender(command.senderMac);
   }
 }
 
@@ -635,97 +912,142 @@ void sendUnicastTest() {
   }
 
   const char *unicastMessage = "TEST";
-  constexpr size_t unicastMessageLength = 4;
-
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, startSenderMac, 6);
-  peerInfo.channel = 1;
-  peerInfo.ifidx = WIFI_IF_STA;
-  peerInfo.encrypt = false;
-
-  printTimestampPrefix();
-  Serial.println("Unicast test");
-  printMacLine("Target MAC: ", startSenderMac);
-  Serial.printf("Channel: %d\n", peerInfo.channel);
-  printPacketDetails(reinterpret_cast<const uint8_t *>(unicastMessage),
-                     unicastMessageLength);
-
-  if (!esp_now_is_peer_exist(startSenderMac)) {
-    const esp_err_t peerResult = esp_now_add_peer(&peerInfo);
-    Serial.printf("Unicast peer add result: %d\n", peerResult);
-    if (peerResult != ESP_OK && peerResult != ESP_ERR_ESPNOW_EXIST) {
-      printTimestampPrefix();
-      Serial.printf("Unicast send failed: peer add error: %d\n", peerResult);
-      return;
-    }
-  } else {
-    Serial.println("Unicast peer already exists; reusing peer");
-  }
-
-  Serial.printf("Unicast peer exists: %s\n",
-                esp_now_is_peer_exist(startSenderMac) ? "YES" : "NO");
-
-  const esp_err_t sendResult = esp_now_send(
+  sendPacketWithCallback(
+      "TEST",
       startSenderMac,
       reinterpret_cast<const uint8_t *>(unicastMessage),
-      unicastMessageLength);
-  Serial.printf("esp_now_send return: %d\n", sendResult);
+      strlen(unicastMessage),
+      1);
 }
 
 void OnDataSent(const uint8_t *macAddress, esp_now_send_status_t status) {
-  printTimestampPrefix();
-  if (memcmp(macAddress, startSenderMac, 6) == 0) {
-    Serial.printf("TEST send callback Status: %s\n",
-                  status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
-  } else {
-    Serial.println("TX DONE callback");
-    Serial.printf("DONE send callback Status: %s\n",
-                  status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
-  }
+  portENTER_CRITICAL(&sendCallbackMux);
+  memcpy((void *)sendCallbackMac, macAddress, sizeof(sendCallbackMac));
+  sendCallbackStatus = status;
+  sendCallbackReceived = true;
+  portEXIT_CRITICAL(&sendCallbackMux);
 }
 
 void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
   char eventDate[9] = {};
   char eventTime[7] = {};
+  const unsigned long receivedMillis = millis();
 
   if (parseTimedCommand(incomingData,
                         len,
                         "START",
                         eventDate,
                         eventTime)) {
-    queuePendingCommand(PENDING_START, eventDate, eventTime, mac);
+    Serial.printf("[TIME] START received ESP32 millis: %lu\n",
+                  receivedMillis);
+    Serial.printf("[TIME] M5 START datetime: %s %s\n",
+                  eventDate, eventTime);
+    const bool queued =
+        queuePendingCommand(PENDING_START,
+                            eventDate,
+                            eventTime,
+                            mac,
+                            receivedMillis);
+    if (queued) {
+      startPeerConfigured = false;
+      startSdCheckRequired = true;
+      if (!sdCardReady) {
+        Serial.println("START queued: SD card not ready");
+      }
+    }
   } else if (parseTimedCommand(incomingData,
                                len,
                                "STOP",
                                eventDate,
                                eventTime)) {
-    queuePendingCommand(PENDING_STOP, eventDate, eventTime, mac);
+    queuePendingCommand(PENDING_STOP,
+                        eventDate,
+                        eventTime,
+                        mac,
+                        receivedMillis);
   }
 }
 
 void processPendingCommand() {
   PendingCommand command;
-  if (!takePendingCommand(command)) {
+  if (!peekPendingCommand(command)) {
     return;
   }
 
   if (command.type == PENDING_START) {
     if (currentState != STANDBY) {
+      takePendingCommand(command);
       printTimestampPrefix();
       Serial.println("START ignored: already RUNNING");
       return;
     }
 
-    if (!beginRecording(command.date, command.time)) {
-      printTimestampPrefix();
-      Serial.println("START rejected: recording initialization failed");
+    if (!startPeerConfigured) {
+      if (!recreatePeerForStartSender(command.senderMac)) {
+        printTimestampPrefix();
+        Serial.println("START failed: could not configure M5 peer");
+        return;
+      }
+      startPeerConfigured = true;
+    }
+
+    // Leave the complete START command in the queue until the background SD
+    // retry has succeeded.  It is consumed exactly once below.
+    if (startSdCheckRequired || !sdCardReady) {
       return;
+    }
+
+    if (command.queuedWhileSdNotReady) {
+      printTimestampPrefix();
+      Serial.println("Processing queued START");
     }
 
     memcpy(startSenderMac, command.senderMac, sizeof(startSenderMac));
     hasStartSenderMac = true;
+    Serial.printf("[TIME] START received ESP32 millis: %lu\n",
+                  command.receivedMillis);
+    Serial.printf("[TIME] SD ready millis: %lu\n", sdReadyMillis);
+    Serial.printf("[TIME] M5 START datetime retained: %s %s\n",
+                  command.date, command.time);
+    Serial.println("[REC] SD card ready");
+    Serial.println("[REC] /recordings directory ready");
+    Serial.printf("[REC] START retry count: %u\n",
+                  command.sdRetryFailures);
+
+    if (!beginRecording(command.date, command.time)) {
+      if (!sdCardReady) {
+        startSdCheckRequired = true;
+        sdTestAttemptFailed = false;
+        PendingCommand exhaustedCommand;
+        if (recordPendingStartRetry(exhaustedCommand)) {
+          startSdCheckRequired = false;
+          printTimestampPrefix();
+          Serial.println("START failed: SD card initialization retries exhausted");
+          sendErrorToSender(exhaustedCommand.senderMac);
+        }
+        return;
+      }
+
+      startSdCheckRequired = false;
+      if (!takePendingCommand(command)) {
+        return;
+      }
+      printTimestampPrefix();
+      Serial.println("START failed");
+      sendErrorToSender(command.senderMac);
+      hasStartSenderMac = false;
+      startPeerConfigured = false;
+      return;
+    }
+
+    if (!takePendingCommand(command)) {
+      return;
+    }
+
     currentState = RUNNING;
     pendingUnicastTest = true;
+    printTimestampPrefix();
+    Serial.println("Recording started");
     printTimestampPrefix();
     Serial.println("START received");
     printTimestampPrefix();
@@ -740,6 +1062,10 @@ void processPendingCommand() {
   }
 
   if (command.type == PENDING_STOP) {
+    if (!takePendingCommand(command)) {
+      return;
+    }
+
     if (currentState != RUNNING) {
       printTimestampPrefix();
       Serial.println("STOP ignored: already STANDBY");
@@ -747,21 +1073,35 @@ void processPendingCommand() {
     }
 
     const unsigned long stopMillis = millis();
+    char endDate[9] = {};
+    char endTime[7] = {};
+    makeEndTimestamp(endDate, endTime, stopMillis);
+    uint8_t responseMac[6] = {};
+    const bool responseMacAvailable = hasStartSenderMac;
+    if (responseMacAvailable) {
+      memcpy(responseMac, startSenderMac, sizeof(responseMac));
+    }
     const bool recordingFinished =
-        finishRecording("STOP", command.date, command.time, stopMillis);
+        finishRecording("STOP", endDate, endTime, stopMillis);
     currentState = STANDBY;
-    hasStartSenderMac = false;
     printTimestampPrefix();
     Serial.println("RX STOP recognized");
     Serial.println("State -> STANDBY");
-    if (!recordingFinished) {
+    if (!recordingFinished && responseMacAvailable) {
+      sendErrorToSender(responseMac);
+    } else if (!recordingFinished) {
       Serial.println("Recording stopped with SD error; remount required");
     }
+    hasStartSenderMac = false;
+    startPeerConfigured = false;
   }
 }
 
 void setup() {
   Serial.begin(115200);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
 
   audioReady = i2s_up();
   if (!audioReady) {
@@ -769,8 +1109,12 @@ void setup() {
   }
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  const esp_err_t powerSaveResult = esp_wifi_set_ps(WIFI_PS_NONE);
+  printTimestampPrefix();
+  Serial.printf("WiFi sleep disabled result: %d\n", powerSaveResult);
   esp_err_t channelResult =
-      esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+      esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   printTimestampPrefix();
   Serial.printf("WiFi channel set result: %d\n", channelResult);
   printTimestampPrefix();
@@ -805,13 +1149,8 @@ void setup() {
 }
 
 void loop() {
-  if (!sdCardReady && millis() >= nextSdRetryMillis) {
-    if (runSdCardTest()) {
-      nextSdRetryMillis = 0;
-    } else {
-      nextSdRetryMillis = millis() + SD_RETRY_INTERVAL_MS;
-    }
-  }
+  runSdCardTestWithRetries();
+  failQueuedStartAfterSdRetries();
 
   processPendingCommand();
 
@@ -832,8 +1171,16 @@ void loop() {
         if (!wavWriter.writeData(recordingWavFile,
                                  audioBuffer,
                                  samplesRead)) {
+          uint8_t responseMac[6] = {};
+          const bool responseMacAvailable = hasStartSenderMac;
+          if (responseMacAvailable) {
+            memcpy(responseMac, startSenderMac, sizeof(responseMac));
+          }
           reportRecordingError("WAV audio data write failed");
           markSdCardNeedsRemount("WAV audio data write failure");
+          if (responseMacAvailable) {
+            sendErrorToSender(responseMac);
+          }
           return;
         }
       }
@@ -843,6 +1190,11 @@ void loop() {
       char endDate[9] = {};
       char endTime[7] = {};
       makeEndTimestamp(endDate, endTime, now);
+      uint8_t responseMac[6] = {};
+      const bool responseMacAvailable = hasStartSenderMac;
+      if (responseMacAvailable) {
+        memcpy(responseMac, startSenderMac, sizeof(responseMac));
+      }
       const bool recordingFinished =
           finishRecording("END", endDate, endTime, now);
       currentState = STANDBY;
@@ -853,10 +1205,11 @@ void loop() {
                          ? "Recording finished"
                          : "Recording stopped with SD error");
       Serial.println("State -> STANDBY");
-      if (recordingFinished) {
-        sendDoneToStartSender();
+      if (!recordingFinished && responseMacAvailable) {
+        sendErrorToSender(responseMac);
       }
       hasStartSenderMac = false;
+      startPeerConfigured = false;
     }
   }
 
