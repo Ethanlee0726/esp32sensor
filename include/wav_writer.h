@@ -33,11 +33,18 @@ public:
   bool finalize(FsFile &file);
 
 private:
+  static constexpr size_t WRITE_BUFFER_SIZE = 8192;
+
   uint32_t sampleRate_ = 0;
   uint16_t channels_ = 0;
   uint16_t bitsPerSample_ = 0;
   uint32_t dataSize_ = 0;
+  uint32_t bytesSinceSync_ = 0;
+  uint32_t syncIntervalBytes_ = 0;
+  size_t bufferedBytes_ = 0;
+  uint8_t writeBuffer_[WRITE_BUFFER_SIZE] = {};
 
   void createHeader(WavHeader &header);
+  bool flushBuffer(FsFile &file);
   bool updateHeader(FsFile &file);
 };

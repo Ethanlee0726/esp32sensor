@@ -28,6 +28,10 @@ bool WavWriter::begin(FsFile &file,
   channels_ = channels;
   bitsPerSample_ = bitsPerSample;
   dataSize_ = 0;
+  bytesSinceSync_ = 0;
+  syncIntervalBytes_ =
+      sampleRate_ * channels_ * (bitsPerSample_ / 8);
+  bufferedBytes_ = 0;
 
   WavHeader header;
   createHeader(header);
@@ -57,27 +61,58 @@ bool WavWriter::begin(FsFile &file,
 bool WavWriter::writeData(FsFile &file,
                           const int16_t *buffer,
                           size_t samples) {
+  if (!file.isOpen() || buffer == nullptr) {
+    return false;
+  }
+
+  const uint8_t *source = reinterpret_cast<const uint8_t *>(buffer);
+  size_t bytesRemaining = samples * sizeof(int16_t);
+  while (bytesRemaining > 0) {
+    const size_t available = WRITE_BUFFER_SIZE - bufferedBytes_;
+    const size_t bytesToCopy = min(bytesRemaining, available);
+    memcpy(writeBuffer_ + bufferedBytes_, source, bytesToCopy);
+    bufferedBytes_ += bytesToCopy;
+    source += bytesToCopy;
+    bytesRemaining -= bytesToCopy;
+
+    if (bufferedBytes_ == WRITE_BUFFER_SIZE && !flushBuffer(file)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool WavWriter::flushBuffer(FsFile &file) {
   if (!file.isOpen()) {
     return false;
   }
 
-  const size_t bytes = samples * sizeof(int16_t);
-  const size_t written = file.write(
-      reinterpret_cast<const uint8_t *>(buffer),
-      bytes);
-
-  if (written != bytes) {
-    Serial.printf("[WAV] Write error: %u/%u bytes\n",
-                  static_cast<unsigned>(written),
-                  static_cast<unsigned>(bytes));
-    return false;
+  if (bufferedBytes_ == 0) {
+    return true;
   }
 
+  const size_t bytesToWrite = bufferedBytes_;
+  const size_t written = file.write(writeBuffer_, bytesToWrite);
   dataSize_ += written;
-  if (!file.sync()) {
-    Serial.println("[WAV] Audio data sync failed");
+  bytesSinceSync_ += written;
+
+  if (written != bytesToWrite) {
+    Serial.printf("[WAV] Audio write failed: %u/%u bytes\n",
+                  static_cast<unsigned>(written),
+                  static_cast<unsigned>(bytesToWrite));
     return false;
   }
+
+  bufferedBytes_ = 0;
+  if (syncIntervalBytes_ > 0 && bytesSinceSync_ >= syncIntervalBytes_) {
+    if (!file.sync()) {
+      Serial.println("[WAV] Periodic audio sync failed");
+      return false;
+    }
+    bytesSinceSync_ = 0;
+  }
+
   return true;
 }
 
@@ -100,13 +135,19 @@ bool WavWriter::finalize(FsFile &file) {
   }
 
   Serial.printf("[WAV] Finalizing: %u bytes audio data\n",
-                static_cast<unsigned>(dataSize_));
+                static_cast<unsigned>(dataSize_ + bufferedBytes_));
 
-  if (!updateHeader(file)) {
+  if (!flushBuffer(file)) {
+    Serial.println("[WAV] Final buffered audio write failed");
     return false;
   }
 
-  if (!file.sync() || !file.seek(file.size()) || !file.sync()) {
+  if (!updateHeader(file)) {
+    Serial.println("[WAV] Final header update failed");
+    return false;
+  }
+
+  if (!file.sync()) {
     Serial.println("[WAV] Final sync failed");
     return false;
   }
